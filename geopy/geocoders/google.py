@@ -1,5 +1,7 @@
 from urllib import urlencode
 from urllib2 import urlopen
+from geopy import util
+
 try:
     import json
 except ImportError:
@@ -8,18 +10,20 @@ except ImportError:
     except ImportError:
         from django.utils import simplejson as json
 
-import xml
-from xml.parsers.expat import ExpatError
-
 from geopy.geocoders.base import Geocoder,GeocoderError,GeocoderResultError
-from geopy import Point, Location, util
 
 class Google(Geocoder):
     """Geocoder using the Google Maps API."""
     
-    def __init__(self, api_key=None, domain='maps.google.com',
-                 resource=None, format_string='%s', output_format=None):
-        """Initialize a customized Google geocoder with location-specific
+    def __init__(self, api_key=None, domain='maps.googleapis.com',
+                 resource=None, format_string='%s', output_format='json',
+                 sensor=False
+                ):
+        """
+        Google geocoder uses API v3 and supports reverse geo-coding
+
+        
+        Initialize a customized Google geocoder with location-specific
         address information and your Google Maps API key.
 
         ``api_key`` should be a valid Google Maps API key. Required as per Google Geocoding API
@@ -39,39 +43,37 @@ class Google(Geocoder):
         ``output_format`` (DEPRECATED) can be 'json', 'xml', or 'kml' and will
         control the output format of Google's response. The default is 'json'. 'kml' is
         an alias for 'xml'.
+
+        ``sensor`` (required) indicates whether or not the geocoding request comes from a 
+        device with a location sensor. This value must be either true or false.
         """
+
         if resource != None:
             from warnings import warn
             warn('geopy.geocoders.google.GoogleGeocoder: The `resource` parameter is deprecated '+
                  'and now ignored. The Google-supported "maps/geo" API will be used.', DeprecationWarning)
 
-        if output_format != None:
-            from warnings import warn
-            warn('geopy.geocoders.google.GoogleGeocoder: The `output_format` parameter is deprecated.', DeprecationWarning)
-
         self.api_key = api_key
         self.domain = domain
         self.format_string = format_string
+        self.sensor = str(sensor).lower()
         
         if output_format:
-            if output_format not in ('json','xml','kml'):
-                raise ValueError('if defined, `output_format` must be one of: "json","xml","kml"')
-            else:
-                if output_format == "kml":
-                    self.output_format = "xml"
-                else:
-                    self.output_format = output_format
+            supported_formats = ('json',)
+            if output_format not in supported_formats:
+                raise ValueError('if defined, `output_format` must be one of: %s' % supported_formats)
+            self.output_format = output_format
         else:
-            self.output_format = "xml"
+            self.output_format = "json"
 
     @property
     def url(self):
         domain = self.domain.strip('/')
-        return "http://%s/maps/geo?%%s" % domain
+        return "http://%s/maps/api/geocode/%s?%%s" % (domain, self.output_format)
 
     def geocode(self, string, exactly_one=True):
-        params = {'q': self.format_string % string,
-                  'output': self.output_format.lower(),
+        params = {'address': self.format_string % string,
+                  'sensor': self.sensor,
                   }
         
         if self.api_key:
@@ -80,94 +82,53 @@ class Google(Geocoder):
         url = self.url % urlencode(params)
         return self.geocode_url(url, exactly_one)
 
+    def reverse(self, coord, exactly_one=True):
+        (lat,lng) = coord
+        params = {'latlng': self.format_string % lat+','+self.format_string % lng,
+                  'sensor': self.sensor,
+                 }
+
+        url = self.url % urlencode(params)
+        return self.geocode_url(url, exactly_one)
+
     def geocode_url(self, url, exactly_one=True):
+        ## preserve "," in the query url
+        url = url.replace("%2C", ",")
         util.logger.debug("Fetching %s..." % url)
+
         page = urlopen(url)
         
         dispatch = getattr(self, 'parse_' + self.output_format)
-        return dispatch(page, exactly_one)
-
-    def parse_xml(self, page, exactly_one=True):
-        """Parse a location name, latitude, and longitude from an XML response.
-        """
-        if not isinstance(page, basestring):
-            page = util.decode_page(page)
-        try:
-            doc = xml.dom.minidom.parseString(page)
-        except ExpatError:
-            places = []
-            doc = None
-        else:
-            places = doc.getElementsByTagName('Placemark')
-
-        if len(places) == 0 and doc is not None:
-            # Got empty result. Parse out the status code and raise an error if necessary.
-            status = doc.getElementsByTagName("Status")
-            status_code = int(util.get_first_text(status[0], 'code'))
-            self.check_status_code(status_code)
-        
-        if exactly_one and len(places) != 1:
-            raise ValueError("Didn't find exactly one placemark! " \
-                             "(Found %d.)" % len(places))
-        
-        def parse_place(place):
-            location = util.get_first_text(place, ['address', 'name']) or None
-            points = place.getElementsByTagName('Point')
-            point = points and points[0] or None
-            coords = util.get_first_text(point, 'coordinates') or None
-            if coords:
-                longitude, latitude = [float(f) for f in coords.split(',')[:2]]
-            else:
-                latitude = longitude = None
-                _, (latitude, longitude) = self.geocode(location)
-            return (location, (latitude, longitude))
-        
-        if exactly_one:
-            return parse_place(places[0])
-        else:
-            return [parse_place(place) for place in places]
+        status, results = dispatch(page, exactly_one)
+        util.logger.debug("...%s" % status)
+        return results
 
     def parse_json(self, page, exactly_one=True):
         if not isinstance(page, basestring):
             page = util.decode_page(page)
         doc = json.loads(page)
-        places = doc.get('Placemark', [])
+        results = doc.get('results', [])
+        status_code = doc.get("status", 'Empty status')
 
-        if len(places) == 0:
+        if len(results) == 0:
             # Got empty result. Parse out the status code and raise an error if necessary.
-            status = doc.get("Status", [])
-            status_code = status["code"]
             self.check_status_code(status_code)
             return None
-        elif exactly_one and len(places) != 1:
-            raise ValueError("Didn't find exactly one placemark! " \
-                             "(Found %d.)" % len(places))
-
+        
         def parse_place(place):
-            location = place.get('address')
-            longitude, latitude = place['Point']['coordinates'][:2]
-            return (location, (latitude, longitude))
+            formatted_address = place.get('formatted_address')
+            lat = place['geometry']['location']['lat']
+            lng = place['geometry']['location']['lng']
+            return (formatted_address, (lat, lng), place)
         
         if exactly_one:
-            return parse_place(places[0])
+            return status_code, parse_place(results[0])
         else:
-            return [parse_place(place) for place in places]
+            return status_code, [parse_place(place) for place in results]
 
-    def check_status_code(self,status_code):
-        if status_code == 400:
-            raise GeocoderResultError("Bad request (Server returned status 400)")
-        elif status_code == 500:
-            raise GeocoderResultError("Unkown error (Server returned status 500)")
-        elif status_code == 601:
-            raise GQueryError("An empty lookup was performed")
-        elif status_code == 602:
-            raise GQueryError("No corresponding geographic location could be found for the specified location, possibly because the address is relatively new, or because it may be incorrect.")
-        elif status_code == 603:
-            raise GQueryError("The geocode for the given location could be returned due to legal or contractual reasons")
-        elif status_code == 610:
-            raise GBadKeyError("The api_key is either invalid or does not match the domain for which it was given.")
-        elif status_code == 620:
-            raise GTooManyQueriesError("The given key has gone over the requests limit in the 24 hour period or has submitted too many requests in too short a period of time.")
+    def check_status_code(self, status_code):
+        if status_code != 'OK':
+            raise GeocoderResultError(status_code)
 
 class GBadKeyError(GeocoderError):
     pass
@@ -177,3 +138,33 @@ class GQueryError(GeocoderResultError):
 
 class GTooManyQueriesError(GeocoderResultError):
     pass
+
+import unittest
+from random import sample
+import numpy as np
+
+class TestGoogleGeocoder(unittest.TestCase):
+    def setUp(self):
+        GOOGLE_KEY = None
+        self.geocoder = Google(GOOGLE_KEY, output_format='json')
+
+    def test_geocoding(self):
+        address_str = "1600 Pennsylvania Ave, Washington DC"
+        coord = (38.8976777, -77.036517)
+        address = u"1600 Pennsylvania Ave NW, Washington, DC 20502, USA"
+        results = self.geocoder.geocode(address_str)
+        assert len(results) == 3
+        assert results[0] == address
+        assert np.allclose( np.array(results[1]), np.array(coord), atol=1e-3 )
+
+    def test_reverse_geocoding(self):
+        coord = (38.8976777, -77.036517)
+        address = u"1600 Pennsylvania Ave NW, Washington, DC 20502, USA"
+        results = self.geocoder.reverse(coord)
+        assert len(results) == 3
+        assert results[0] == address
+        assert np.allclose( np.array(results[1]), np.array(coord), atol=1e-3 )
+
+if __name__ == '__main__':
+    unittest.main()
+
